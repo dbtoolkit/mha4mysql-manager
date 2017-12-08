@@ -1,0 +1,10 @@
+【功能】
+mha4mysql-manager - Master High Availability Manager and tools for MySQL (MHA) for automating master failover and fast master switch. 
+This package contains manager scripts.
+See http://code.google.com/p/mysql-master-ha/wiki/TableOfContents?tm=6 for details.
+  
+【新增内容】
+master_ip_failover、master_ip_online_change
+   
+【变更内容】
+修改MasterFailover.pm、MasterMonitor.pm、MasterRotate.pm文件支持master_ip_failover、master_ip_online_change传参

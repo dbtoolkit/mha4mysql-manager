@@ -1,0 +1,463 @@
+#!/usr/bin/env perl
+# Description: master ip online change script
+# Authors: 
+#   zhaoyunbo
+
+use strict;
+use warnings FATAL => 'all';
+
+use Getopt::Long;
+use POSIX qw(:signal_h);
+use Tie::File;
+
+use MHA::DBHelper;
+use MHA::ManagerUtil;
+use MHA::NodeUtil;
+use Log::Log4perl;
+
+# 变量定义
+my (
+    $vip,$net_interface,$net_mask,$gateway,
+    $command,$ssh_user,$ssh_port,$orig_master_host,
+    $orig_master_ip,$orig_master_port,$orig_master_user,$orig_master_password,$orig_master_ssh_port,
+    $orig_master_ssh_user,$orig_master_is_new_slave,
+    $new_master_host,$new_master_ip,$new_master_port,$new_master_user,
+    $new_master_password,$new_master_ssh_port,$new_master_ssh_user
+);
+
+# 获取参数
+GetOptions(
+    'vip=s'                 => \$vip,
+    'net_interface=s'       => \$net_interface,
+    'net_mask=s'            => \$net_mask,
+    'gateway=s'             => \$gateway,
+    'command=s'             => \$command,
+    'ssh_user=s'            => \$ssh_user,
+    'ssh_port=s'            => \$ssh_port,
+    'orig_master_host=s'    => \$orig_master_host,
+    'orig_master_ip=s'      => \$orig_master_ip,
+    'orig_master_port=i'    => \$orig_master_port,
+    'orig_master_user=s'    => \$orig_master_user,
+    'orig_master_password=s'=> \$orig_master_password,
+    'orig_master_ssh_port=s'=> \$orig_master_ssh_port,
+    'orig_master_ssh_user=s'   => \$orig_master_ssh_user,
+    'orig_master_is_new_slave' => \$orig_master_is_new_slave,
+    'new_master_host=s'     => \$new_master_host,
+    'new_master_ip=s'       => \$new_master_ip,
+    'new_master_port=i'     => \$new_master_port,
+    'new_master_user=s'     => \$new_master_user,
+    'new_master_password=s' => \$new_master_password,
+    'new_master_ssh_port=s' => \$new_master_ssh_port,
+    'new_master_ssh_user=s' => \$new_master_ssh_user,
+);
+
+# 初始化log4perl
+chomp($orig_master_port);
+my $mhaSwitchLog = "/data/mha/my".$orig_master_port."/mha_online_switch_my".$orig_master_port.".log";   # 切换日志文件
+
+my $logConf = q(
+    log4perl.rootLogger                = DEBUG, logfile
+    log4perl.appender.logfile          = Log::Log4perl::Appender::File
+    log4perl.appender.logfile.mode     = append
+    log4perl.appender.logfile.layout   = Log::Log4perl::Layout::PatternLayout
+    #log4perl.appender.logfile.layout.ConversionPattern = [%d{yyyy-MM-dd HH:mm:ss}] [%p] [%F{1}:%L %M]  %m%n
+    log4perl.appender.logfile.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss}  [%p] [%M] %m%n
+);
+$logConf .= "log4perl.appender.logfile.filename = $mhaSwitchLog";
+
+Log::Log4perl->init( \$logConf );
+my $log = Log::Log4perl->get_logger("");  # get logObject ref
+if ( !$log ){
+    Log::Log4perl->init( \$logConf );
+} 
+
+
+# 执行主程序
+exit &main();
+
+
+# @Description: 主程序
+# @Param: 
+# @Return: 
+sub main {
+    
+    # 获取log对象
+    my $log = Log::Log4perl->get_logger("");
+        
+    if ( $command eq "stop" || $command eq "stopssh" ) {
+        
+        $log->info("action = $command");
+        
+        my $exit_code = 10;
+
+        my $timeout = 30;
+        my $ssh_timeout = 10;
+
+        my $timeout_msg = "IP_FAILOVER_STOP_TIMEOUT"; 
+        my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+        my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+        my $oldaction = POSIX::SigAction->new();
+        sigaction( SIGALRM, $action, $oldaction ); 
+
+        eval {
+            alarm $timeout; 
+            
+            # 检查原主库vip
+            $log->debug("get vip:$vip");
+            if ( $vip ){
+                my $cmd = "/sbin/ip a|grep '$vip'";
+                $log->debug("cmd: $cmd");
+                
+                my $ssh_cmd = "ssh -p $orig_master_ssh_port -o ConnectTimeout=$ssh_timeout $orig_master_ssh_user\@$orig_master_host $cmd";
+                $log->debug("ssh_cmd: $ssh_cmd");
+                
+                $log->info("orig_master_host:$orig_master_host check vip now...");
+                my $check_vip_result = &run_command($ssh_cmd,20);
+                chomp($check_vip_result);
+                $log->debug("$check_vip_result");
+                
+                # 检查vip是否存在
+                if ( $check_vip_result =~ /$vip/ ){
+                    $log->info("orig_master_host:$orig_master_host have vip");
+                    
+                    # 停止vip
+                    $log->info("orig_master_host:$orig_master_host stop vip now...");
+                    my $stop_vip_result = &stop_vip($orig_master_host,$orig_master_ssh_port,$orig_master_ssh_user,$vip,$net_interface,$ssh_timeout);
+                }
+            }
+                  
+            my $orig_master_handler = new MHA::DBHelper();
+            
+            # 连接原主库            
+            $log->debug("get \$orig_master_handler=$orig_master_handler");
+            $log->debug("get \$orig_master_ip=$orig_master_ip  \$orig_master_port=$orig_master_port");
+            $log->debug("get \$orig_master_user=$orig_master_user  \$orig_master_password=xxxxxxxx");
+            $orig_master_handler->connect($orig_master_ip,$orig_master_port,$orig_master_user,$orig_master_password,1);
+
+            if ( defined($orig_master_handler->{dbh}) ){
+
+                # 在原主库阻塞所有写入操作
+                $orig_master_handler->enable_read_only();
+                if ( $orig_master_handler->is_read_only() ){
+                    $log->debug("orig_master set read_only=on success");
+                }
+
+                # 杀掉原主库上所有应用连接会话                
+                my $my_connection_id = $orig_master_handler->{connection_id};
+                $log->debug("get \$my_connection_id is $my_connection_id");
+                kill_mysql_session($orig_master_handler->{dbh},$my_connection_id,5);
+            }
+                        
+            $exit_code = 0;
+
+            alarm 0;
+        };
+        alarm 0; # race condition protection
+        sigaction( SIGALRM, $oldaction );  # 恢复原来signal handler
+
+        if ( $@ ) {
+            $log->error("$@");
+            
+            if ( $@ =~ /$timeout_msg/ ) {
+                # 超时
+                $log->error("execute timeout");
+            }else{
+                # 其它失败
+                $log->error("execute failed");
+            }
+            
+            exit $exit_code;
+        }
+        
+        exit $exit_code;
+        
+    } elsif ( $command eq "start" ) {
+        
+        $log->info("action = $command");
+        
+        my $exit_code = 10;
+
+        my $timeout = 30;
+        my $ssh_timeout = 10;
+
+        my $timeout_msg = "IP_FAILOVER_START_TIMEOUT"; 
+        my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+        my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+        my $oldaction = POSIX::SigAction->new();
+        sigaction( SIGALRM, $action, $oldaction );
+                
+        eval {
+            alarm $timeout;
+
+            my $new_master_handler = new MHA::DBHelper();
+
+            # 连接新主库            
+            $log->info("start connecting to new_master_host:$new_master_host...");
+            $log->debug("get \$new_master_ip=$new_master_ip \$new_master_port=$new_master_port");
+            $log->debug("get \$new_master_user=$new_master_user \$new_master_password=xxxxxxxx");
+            $new_master_handler->connect($new_master_ip,$new_master_port,
+                $new_master_user,$new_master_password,1);
+
+            if ( defined($new_master_handler->{dbh}) ){
+                
+                $log->info("connect to new_master_host:$new_master_host success");
+                   
+                # 新主库打开写入操作
+                $new_master_handler->disable_log_bin_local();
+                $log->info("new_master_host:$new_master_host set read_only=off success");
+                $new_master_handler->disable_read_only();
+                $new_master_handler->enable_log_bin_local();
+    
+                # 新主库杀掉当前所有应用连接会话
+                $log->info("new_master_host:$new_master_host get current connection id");
+                my $my_connection_id = $new_master_handler->{connection_id};
+                $log->debug("get \$my_connection_id is $my_connection_id");
+                kill_mysql_session($new_master_handler->{dbh},$my_connection_id,5);    
+            }
+
+            # 新主库启用vip
+            $log->info("new_master_host:$new_master_host start vip now...");
+            my $start_vip_result = &start_vip($new_master_host,$new_master_ssh_port,$new_master_ssh_user,$vip,$net_interface,$net_mask,$gateway,$ssh_timeout);
+            
+            $exit_code = 0;
+
+            alarm 0;
+        };
+        alarm 0; # race condition protection
+        sigaction( SIGALRM, $oldaction );  # 恢复原来signal handler
+        
+        if ($@) {
+            if ( $@ =~ /$timeout_msg/ ) {
+                # 超时
+                $log->error("execute timeout");
+            }else{
+                # 其它失败
+                $log->error("execute failed");
+            }
+
+            exit $exit_code;
+        }
+        
+        exit $exit_code;
+        
+    } elsif ( $command eq "status" ) {
+        
+        exit 0;
+    } else {
+        &usage();
+        exit 1;
+    }
+}
+
+# @Description: 执行系统命令
+# @Param:
+# @Return: 返回命令执行结果:成功 undef:失败
+sub run_command {
+    my ( $command, $timeout ) = @_;
+     
+    my $log = Log::Log4perl->get_logger("");
+
+    my $timeout_msg = "CMD_TIMEOUT";     
+    my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+    my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+    my $oldaction = POSIX::SigAction->new();
+    sigaction( SIGALRM, $action, $oldaction ); 
+
+    # 执行命令
+    my $result;    
+    eval {
+        alarm $timeout;
+        $result = `$command`;
+        alarm 0;    
+    };
+    alarm 0; 
+    sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+    # 异常处理
+    if ( $@ ) {
+        if ( $@ =~ /$timeout_msg/ ) {
+            $log->error("run command: $command timeout");
+        }else{
+            $log->error("run command: $command failed");
+        }
+        undef $@;
+
+        return;
+    }
+    
+    # 返回命令执行结果
+    $log->info("run command: $command success");
+
+    return $result;
+}
+
+# @Description: 杀mysql会话线程
+# @Param: $dbh,$my_connection_id,$timeout
+# @Return: $kill_count or undef
+sub kill_mysql_session {
+    my ( $dbh,$my_connection_id,$timeout ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $timeout_msg = "KMS_TIMEOUT"; 
+    my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+    my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+    my $oldaction = POSIX::SigAction->new();
+    sigaction( SIGALRM, $action, $oldaction ); 
+    
+    my $kill_count = 0;
+    eval {    
+        alarm $timeout; 
+        my $sql = "show processlist";
+        $log->debug("$sql");
+        
+        my $sth = $dbh->prepare($sql);
+        $sth->execute();
+        while ( my $row_ref = $sth->fetchrow_arrayref() ) {        
+            if ( $row_ref ){
+                my $session_id = $row_ref->[0];
+                my $session_user = $row_ref->[1];
+                chomp($session_id);
+                chomp($session_user);
+                
+                next if ( $my_connection_id == $session_id );
+                
+                # 不杀系统和复制用户
+                if ( $session_user && $session_user !~ /repadm|slave|event_scheduler|system|root|mysql|mysqlha|mha/i ){
+                    if ( $session_id ){
+                        $log->info("kill session: user->$session_user,id->$session_id");
+                        my $kill_sql = "kill $session_id"; 
+                        my $sth_n = $dbh->prepare($kill_sql);
+                        $sth_n->execute();
+                        $sth_n->finish();
+                        $kill_count++;
+                    }
+                } 
+            }
+        }
+        $sth->finish();
+        alarm 0; 
+    };
+    alarm 0; # race condition protection
+    sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+    if ( $@ ) {
+        if ( $@ =~ /$timeout_msg/ ) {
+            $log->error("kill session timeout");
+        }else{
+            $log->error("kill session failed");
+        }
+        undef $@;
+                    
+        return;
+    }
+
+    if ( $kill_count>0 ){
+        $log->info("kill session success");
+    }else{
+        $log->info("no session to kill");
+    }    
+                 
+    return $kill_count;
+}
+
+# @Description: 启用vip
+# @Param: 
+# @Return: 0:成功 1:失败
+sub start_vip {
+    my ( $new_master_host,$new_master_ssh_port,$new_master_ssh_user,$vip,$net_interface,$net_mask,$gateway,$ssh_timeout ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my @vip_str = split(/\./, $vip);
+    my $vip_suffix = $vip_str[2] . $vip_str[3];
+
+    # 启用vip命令
+    my $start_vip_cmd = "sudo /sbin/ifconfig $net_interface:$vip_suffix $vip netmask $net_mask && sudo /sbin/arping -c 3 -s $vip -I $net_interface $gateway";
+    $log->debug("$start_vip_cmd");
+    my $ssh_cmd = "ssh -p $new_master_ssh_port -o ConnectTimeout=$ssh_timeout $new_master_ssh_user\@$new_master_host \" $start_vip_cmd \" ";
+    $log->debug("$ssh_cmd");
+    
+    # 启用vip
+    &run_command($ssh_cmd, 10);
+
+    # 检查启用vip命令
+    my $check_vip_cmd = "/sbin/ip a|grep '$vip'";
+    $log->debug("$check_vip_cmd");
+    my $check_vip_ssh_cmd = "ssh -p $new_master_ssh_port -o ConnectTimeout=$ssh_timeout $new_master_ssh_user\@$new_master_host $check_vip_cmd";
+    $log->debug("$check_vip_ssh_cmd");
+    
+    # 检查启用vip结果
+    my $check_vip_result = &run_command($check_vip_ssh_cmd, 10);    
+    if ( $check_vip_result =~ /$vip/ ){
+        $log->info("start vip $vip on new_master_host:$new_master_host success");
+        
+        return 0;
+    } else {
+        $log->error("start vip $vip on new_master_host:$new_master_host failed");
+        
+        return 1;
+    }
+}
+
+# @Description: 移除vip
+# @Param: 
+# @Return: 0:成功 1:失败
+sub stop_vip {
+    my ( $orig_master_host,$orig_master_ssh_port,$orig_master_ssh_user,$vip,$net_interface,$ssh_timeout ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");    
+
+    my @vip_str = split(/\./, $vip);
+    my $vip_suffix = $vip_str[2] . $vip_str[3];
+    
+    # 移除vip命令
+    my $stop_vip_cmd = "sudo /sbin/ifconfig $net_interface:$vip_suffix down";
+    $log->debug("stop_vip_cmd: $stop_vip_cmd");
+    my $ssh_cmd = "ssh -p $orig_master_ssh_port -o ConnectTimeout=$ssh_timeout $orig_master_ssh_user\@$orig_master_host \" $stop_vip_cmd \" ";
+    $log->debug("ssh_cmd: $ssh_cmd");
+
+    # 移除vip    
+    &run_command($ssh_cmd, 10);
+
+    # 检查移除vip命令
+    my $check_vip_cmd = "/sbin/ip a|grep '$vip'";
+    $log->debug("check_vip_cmd: $check_vip_cmd");
+    my $check_vip_ssh_cmd = "ssh -p $orig_master_ssh_port -o ConnectTimeout=$ssh_timeout $orig_master_ssh_user\@$orig_master_host $check_vip_cmd";
+    $log->debug("check_vip_ssh_cmd: $check_vip_ssh_cmd");
+    
+    # 检查移除vip结果
+    my $check_vip_result = &run_command($check_vip_ssh_cmd, 10);    
+    if ( $check_vip_result =~ /$vip/ ){
+        $log->error("stop vip $vip on orig_master_host:$orig_master_host failed");
+        
+        return 1;
+    } else {
+        $log->info("stop vip $vip on orig_master_host:$orig_master_host success");
+        
+        return 0;
+    }
+}
+
+# @Description: 获取时间
+# @Param: 
+# @Return: 
+sub get_local_time {
+    my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime(time());
+    
+    $year = $year + 1900;
+    $mon++; 
+    my $localtime = $year . $mon . $mday . $hour . $min . $sec;
+
+    return $localtime;
+}
+
+# @Description: 使用说明
+# @Param: 
+# @Return: 
+sub usage {
+    print "Usage: master_ip_online_change --vip=vip --net_interface=net_interface --net_mask=net_mask --gateway=gateway 
+        --command=start|stop|stopssh|status --orig_master_host=host --orig_master_ip=ip 
+        --orig_master_port=port --new_master_host=host --new_master_ip=ip --new_master_port=port\n";
+}
+
