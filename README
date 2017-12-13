@@ -7,4 +7,4 @@ See http://code.google.com/p/mysql-master-ha/wiki/TableOfContents?tm=6 for detai
 master_ip_failover、master_ip_online_change
    
 【变更内容】
-修改MasterFailover.pm、MasterMonitor.pm、MasterRotate.pm文件支持master_ip_failover、master_ip_online_change传参
+修改MasterFailover.pm、MasterMonitor.pm文件支持master_ip_failover、master_ip_online_change传参

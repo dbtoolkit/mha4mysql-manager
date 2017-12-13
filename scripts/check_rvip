@@ -16,8 +16,8 @@ use Fcntl qw(:flock);
 
 # 数据库连接信息
 my $host = "127.0.0.1";
-my $username = "mysqlha";
-my $password = "xxxxx";
+my $username = "mysql";
+my $password = "xxxx";
 
 # mha vip配置文件
 my $mhaVipConf = "/etc/mha_vip.conf";

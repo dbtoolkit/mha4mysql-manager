@@ -218,10 +218,6 @@ sub check_scripts($) {
   if ( $current_master->{master_ip_failover_script} ) {
     my $command =
 "$current_master->{master_ip_failover_script} --command=status --ssh_user=$current_master->{ssh_user} --orig_master_host=$current_master->{hostname} --orig_master_ip=$current_master->{ip} --orig_master_port=$current_master->{port}";
-
-    # add options 
-    $command .= " --orig_master_user=$current_master->{escaped_user}" . " --orig_master_password=$current_master->{escaped_password}";
-
     $command .= $current_master->get_ssh_args_if( 1, "orig", 1 );
     $log->info("Checking master_ip_failover_script status:");
     $log->info("  $command");

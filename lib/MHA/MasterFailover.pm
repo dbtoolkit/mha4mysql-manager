@@ -328,10 +328,6 @@ sub force_shutdown_internal($) {
   if ( $dead_master->{master_ip_failover_script} ) {
     my $command =
 "$dead_master->{master_ip_failover_script} --orig_master_host=$dead_master->{hostname} --orig_master_ip=$dead_master->{ip} --orig_master_port=$dead_master->{port}";
-    
-    # add options 
-    $command .= " --orig_master_user=$dead_master->{escaped_user}" . " --orig_master_password=$dead_master->{escaped_password}";
-    
     if ( $_real_ssh_reachable == 1 ) {
       $command .=
         " --command=stopssh" . " --ssh_user=$dead_master->{ssh_user} ";
@@ -1579,10 +1575,6 @@ sub recover_master($$$$) {
     $log->info("Executing master IP activate script:");
     $log->info("  $command --new_master_password=xxx");
     $command .= " --new_master_password=$new_master->{escaped_password}";
-
-    # add options 
-    $command .= " --orig_master_user=$dead_master->{escaped_user}" . " --orig_master_password=$dead_master->{escaped_password}";
-
     my ( $high, $low ) = MHA::ManagerUtil::exec_system( $command, $g_logfile );
     if ( $high == 0 && $low == 0 ) {
       $log->info(" OK.");

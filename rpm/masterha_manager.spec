@@ -13,7 +13,7 @@ Requires: perl(Config::Tiny)
 Requires: perl(Log::Dispatch)
 Requires: perl(Parallel::ForkManager)
 Requires: mha4mysql-node >= 0.54
-Requires: perl(DBD::mysql) >= 4.031
+Requires: perl(DBD::mysql) >= 4.012
 Source0: mha4mysql-manager-%{version}.tar.gz
 
 %description
@@ -58,6 +58,7 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(-,root,root,-)
 
 %changelog
+
 * Sun May 31 2015 Yoshinori Matsunobu <Yoshinori.Matsunobu@gmail.com>
 - (Note: All changelogs are written here: http://code.google.com/p/mysql-master-ha/wiki/ReleaseNotes )
 - Version 0.57
