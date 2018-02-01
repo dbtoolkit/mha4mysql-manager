@@ -1,0 +1,743 @@
+#!/usr/bin/env perl
+# Description: master ip failover script
+# Authors: 
+#   zhaoyunbo
+
+use strict;
+use warnings FATAL => 'all';
+
+use Getopt::Long;
+use POSIX qw(:signal_h);
+use Tie::File;
+
+use MHA::DBHelper;
+use MHA::ManagerUtil;
+use MHA::NodeUtil;
+use MHA::ServerManager;
+use Log::Log4perl;
+use Parallel::ForkManager;
+
+# 变量定义
+my (
+    $zkapi_a,$zkapi_b,$rvip_a,$rvip_b,
+    $manager_workdir,$command,$ssh_user,$ssh_port,$orig_master_host,
+    $orig_master_ip,$orig_master_port,$orig_master_user,$orig_master_password,$orig_master_ssh_port,
+    $orig_master_ssh_user,$orig_master_is_new_slave,
+    $new_master_host,$new_master_ip,$new_master_port,$new_master_user,
+    $new_master_password,$new_master_ssh_port,$new_master_ssh_user
+);
+
+# 获取参数
+GetOptions(
+    'zkapi_a=s'             => \$zkapi_a,
+    'zkapi_b=s'             => \$zkapi_b,
+    'rvip_a=s'              => \$rvip_a,
+    'rvip_b=s'              => \$rvip_b,
+    'manager_workdir=s'     => \$manager_workdir,
+    'command=s'             => \$command,
+    'ssh_user=s'            => \$ssh_user,
+    'ssh_port=s'            => \$ssh_port,
+    'orig_master_host=s'    => \$orig_master_host,
+    'orig_master_ip=s'      => \$orig_master_ip,
+    'orig_master_port=i'    => \$orig_master_port,
+    'orig_master_user=s'    => \$orig_master_user,
+    'orig_master_password=s'=> \$orig_master_password,
+    'orig_master_ssh_port=s'=> \$orig_master_ssh_port,
+    'orig_master_ssh_user=s'   => \$orig_master_ssh_user,
+    'orig_master_is_new_slave' => \$orig_master_is_new_slave,
+    'new_master_host=s'     => \$new_master_host,
+    'new_master_ip=s'       => \$new_master_ip,
+    'new_master_port=i'     => \$new_master_port,
+    'new_master_user=s'     => \$new_master_user,
+    'new_master_password=s' => \$new_master_password,
+    'new_master_ssh_port=s' => \$new_master_ssh_port,
+    'new_master_ssh_user=s' => \$new_master_ssh_user,
+);
+
+# 初始化log4perl
+chomp($manager_workdir);
+my $mha_switch_log = $manager_workdir . "/master_ip_failover.log";  # 切换日志文件
+
+my $log_conf = q(
+    log4perl.rootLogger                = DEBUG, logfile
+    log4perl.appender.logfile          = Log::Log4perl::Appender::File
+    log4perl.appender.logfile.mode     = append
+    log4perl.appender.logfile.layout   = Log::Log4perl::Layout::PatternLayout
+    log4perl.appender.logfile.layout.ConversionPattern = %d{yyyy-MM-dd HH:mm:ss}  [%p] [%M] %m%n
+);
+$log_conf .= "log4perl.appender.logfile.filename = $mha_switch_log";
+
+Log::Log4perl->init( \$log_conf );
+my $log = Log::Log4perl->get_logger("");  # get logObject ref
+if ( !$log ){
+    Log::Log4perl->init( \$log_conf );
+} 
+
+# 执行主程序
+exit &main();
+
+
+# @Description: 主程序
+# @Param: 
+# @Return: 
+sub main {
+
+    my $log = Log::Log4perl->get_logger("");
+        
+    if ( $command eq "stop" || $command eq "stopssh" ) {
+        
+        $log->info();
+        $log->info("action = $command");
+        $log->info();
+        
+        my $exit_code = 10;
+
+        my $ssh_timeout = 10;
+        
+        # 超时控制
+        my $timeout = 30;        
+        my $timeout_msg = "IP_FAILOVER_STOP_TIMEOUT"; 
+        my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+        my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+        my $oldaction = POSIX::SigAction->new();
+        sigaction( SIGALRM, $action, $oldaction ); 
+
+        eval {
+            # 超时定时器
+            alarm $timeout; 
+
+            # 在配置中心摘除主库节点
+            $log->info();
+            $log->info("start setting orig_master offline on zkapi server: $zkapi_a");
+            
+            my $set_orig_master_offline_a = &set_zk_node_data($zkapi_a,$orig_master_host,$orig_master_port,0,"master");
+            if ( $set_orig_master_offline_a ){
+                $log->error("zk:$zkapi_a set master offline failed");
+            }else{
+                $log->info("zk:$zkapi_a set master offline success");
+            }
+            
+            $log->info();
+            $log->info("start setting orig_master offline on zkapi server: $zkapi_b");
+            
+            my $set_orig_master_offline_b = &set_zk_node_data($zkapi_b,$orig_master_host,$orig_master_port,0,"master");
+            if ( $set_orig_master_offline_b ){
+                $log->error("zk:$zkapi_b set master offline failed");
+            }else{
+                $log->info("zk:$zkapi_b set master offline success");
+            }
+                        
+            # 创建数据库管理对象
+            my $orig_master_handler = new MHA::DBHelper();
+
+            # 连接原主库
+            $log->info();
+            $log->debug("get \$orig_master_handler: $orig_master_handler");
+            $log->debug("get \$orig_master_ip=$orig_master_ip  \$orig_master_port=$orig_master_port");
+            $log->debug("get \$orig_master_user=$orig_master_user  \$orig_master_password=xxxxxxx"); 
+            $orig_master_handler->connect( $orig_master_ip, $orig_master_port,
+                $orig_master_user, $orig_master_password, 1);
+
+            if ( defined($orig_master_handler->{dbh}) ){
+                
+                # 在主库阻塞所有写入操作
+                $log->info();
+                $log->info("start setting orig_master_host read_only=on");
+                
+                $orig_master_handler->enable_read_only();
+                if ( $orig_master_handler->is_read_only() ){
+                    $log->info("orig_master_host set read_only=on success");
+                }else{
+                    $log->error("orig_master_host set read_only=on failed");
+                }
+                
+                # 杀掉原主库上所有应用连接会话 
+                $log->info();
+                $log->info("start killing session on orig_master_host");
+                
+                my $my_connection_id = $orig_master_handler->{connection_id};
+                $log->debug("get \$my_connection_id: $my_connection_id");
+                kill_mysql_session($orig_master_handler->{dbh},$my_connection_id,5);
+            }
+
+            $exit_code = 0;
+
+            alarm 0;
+        };
+        alarm 0; # race condition protection
+        sigaction( SIGALRM, $oldaction );  # 恢复原来signal handler
+        
+        # 异常处理
+        if ( $@ ) {
+            $log->error("$@");
+
+            if ( $@ =~ /$timeout_msg/ ) {
+                # 超时
+                $log->error("execute timeout");
+            }else{
+                # 其它失败
+                $log->error("execute failed");
+            }
+            
+            exit $exit_code;
+        }
+        
+        exit $exit_code;
+        
+    } elsif ( $command eq "start" ) {
+
+        $log->info();        
+        $log->info("action = $command");
+        $log->info();
+        
+        my $exit_code = 10;
+
+        my $ssh_timeout = 10;
+        
+        # 超时控制
+        my $timeout = 30;
+        my $timeout_msg = "IP_FAILOVER_START_TIMEOUT"; 
+        my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+        my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+        my $oldaction = POSIX::SigAction->new();
+        sigaction( SIGALRM, $action, $oldaction );
+                
+        eval {
+            # 超时定时器
+            alarm $timeout;
+
+            # 创建数据库管理对象            
+            my $new_master_handler = new MHA::DBHelper();
+           
+            # 连接新主库
+            $log->info("start connecting to new_master_host:$new_master_port...");
+            $log->debug("get \$new_master_ip=$new_master_ip \$new_master_port=$new_master_port");
+            $log->debug("get \$new_master_user=$new_master_user \$new_master_password=xxxxxxx");
+            $new_master_handler->connect($new_master_ip,$new_master_port,$new_master_user,$new_master_password,1);
+
+            if ( defined($new_master_handler->{dbh}) ){
+                
+                # 连接新主库正常
+                $log->info("connect to new_master_host:$new_master_host success");
+                   
+                # 新主库打开写入操作
+                $log->info();
+                $log->info("start setting read_only=off on new_master_host");
+                
+                $new_master_handler->disable_log_bin_local();
+                $log->info("new_master_host:$new_master_host set read_only=off success");
+                $new_master_handler->disable_read_only();
+                $new_master_handler->enable_log_bin_local();
+
+                # 新主库杀掉当前所有应用连接会话
+                $log->info();
+                $log->info("start killing session on new_master_host:$new_master_host");
+                       
+                $log->debug("new_master_host:$new_master_host get current connection id");
+                my $my_connection_id = $new_master_handler->{connection_id};
+                
+                $log->debug("get \$my_connection_id: $my_connection_id");
+                kill_mysql_session($new_master_handler->{dbh},$my_connection_id,5);
+            }
+
+            # 在配置中心调整新主库权重
+            $log->info();
+            $log->info("start setting new_master_host online on zkapi server: $zkapi_a");
+
+            my $zkapi_a_online_master = &set_zk_node_data($zkapi_a,$new_master_host,$new_master_port,1,"master");
+            if ( $zkapi_a_online_master ){
+                $log->error("zk:$zkapi_a set new_master online failed");
+            }else{
+                $log->info("zk:$zkapi_a set new_master online success");
+            }
+
+            $log->info();
+            $log->info("start setting new_master_host online on zkapi server: $zkapi_b");
+
+            my $zkapi_b_online_master = &set_zk_node_data($zkapi_b,$new_master_host,$new_master_port,1,"master");            
+            if ( $zkapi_b_online_master ){
+                $log->error("zk:$zkapi_b set new_master online failed");
+            }else{
+                $log->info("zk:$zkapi_b set new_master online success");
+            }
+
+            # 在配置中心调整新旧读vip权重
+
+            # 检查判断新旧读vip
+            $log->info();
+            $log->info("start checking rvip type...");
+            
+            my ( $orig_rvip,$new_rvip ) = &get_rvip_type($rvip_a,$rvip_b,$orig_master_host,$new_master_host);
+
+            my $switch_type = &check_switch_type($orig_master_host,$new_master_host);
+            
+            # 主库跨机房切换,读vip也跟着跨机房切换
+            if ( $switch_type eq "daul" ){
+                
+                # 新读vip上线
+                $log->info();
+                $log->info("start setting new_rvip:$new_rvip online on zkapi server: $zkapi_a");
+                
+                my $new_rvip_online_a = &set_zk_node_data($zkapi_a,$new_rvip,$new_master_port,1,"slave");            
+                if ( $new_rvip_online_a ){
+                    $log->error("zk:$zkapi_a set new_rvip online failed");
+                }else{
+                    $log->info("zk:$zkapi_a set new_rvip online success");
+                }                
+
+                $log->info("start setting new_rvip:$new_rvip online on zkapi server: $zkapi_b");
+                my $new_rvip_online_b = &set_zk_node_data($zkapi_b,$new_rvip,$new_master_port,1,"slave");            
+                if ( $new_rvip_online_b ){
+                    $log->error("zk:$zkapi_b set new_rvip online failed");
+                }else{
+                    $log->info("zk:$zkapi_b set new_rvip online success");
+                }                 
+                
+                # 旧读vip下线
+                $log->info();
+                $log->info("start setting orig_rvip:$orig_rvip offline on zkapi server: $zkapi_a");
+                
+                my $orig_rvip_offline_a = &set_zk_node_data($zkapi_a,$orig_rvip,$orig_master_port,0,"slave");            
+                if ( $orig_rvip_offline_a ){
+                    $log->error("zk:$zkapi_a set orig_rvip offline failed");
+                }else{
+                    $log->info("zk:$zkapi_a set orig_rvip offline success");
+                }                
+
+                $log->info("start setting orig_rvip:$orig_rvip offline on zkapi server: $zkapi_b");
+                
+                my $orig_rvip_offline_b = &set_zk_node_data($zkapi_b,$orig_rvip,$orig_master_port,0,"slave");            
+                if ( $orig_rvip_offline_b ){
+                    $log->error("zk:$zkapi_b set orig_rvip offline failed");
+                }else{
+                    $log->info("zk:$zkapi_b set orig_rvip offline success");
+                }                 
+
+                # 创建数据库管理对象
+                my $orig_rvip_handler = new MHA::DBHelper();
+
+                # 连接旧读vip
+                $log->info();
+                $log->debug("get \$orig_rvip_handler: $orig_rvip_handler");
+                $log->debug("get \$orig_rvip=$orig_rvip  \$orig_master_port=$orig_master_port");
+                $log->debug("get \$orig_master_user=$orig_master_user  \$orig_master_password=xxxxxxx");
+                $orig_rvip_handler->connect( $orig_rvip, $orig_master_port,
+                    $orig_master_user, $orig_master_password, 1);
+    
+                if ( defined($orig_rvip_handler->{dbh}) ){
+                                        
+                    # 杀掉旧读vip上所有应用连接会话
+                    $log->info();
+                    $log->info("start killing session on orig_rvip: $orig_rvip...");
+                    
+                    my $my_connection_id = $orig_rvip_handler->{connection_id};
+                    $log->debug("get \$my_connection_id: $my_connection_id");
+                    kill_mysql_session($orig_rvip_handler->{dbh},$my_connection_id,5);
+                }
+                
+            }
+
+            $exit_code = 0;
+
+            alarm 0;
+        };
+        alarm 0; # race condition protection
+        sigaction( SIGALRM, $oldaction );  # 恢复原来signal handler
+        
+        if ($@) {
+            $log->error("$@");
+            
+            if ( $@ =~ /$timeout_msg/ ) {
+                # 超时
+                $log->error("execute timeout");
+            }else{
+                # 其它失败
+                $log->error("execute failed");
+            }
+            undef $@;
+
+            exit $exit_code;
+        }
+        
+        exit $exit_code;
+        
+    } elsif ( $command eq "status" ) {
+        
+        exit 0;
+    } else {
+        &usage();
+        exit 1;
+    }
+}
+
+# @Description: 执行系统命令
+# @Param: $command,$timeout
+# @Return: 返回执行结果:成功 undef:失败
+sub run_command {
+    my ( $command, $timeout ) = @_;
+     
+    my $log = Log::Log4perl->get_logger("");
+    
+    my $timeout_msg = "CMD_TIMEOUT";     
+    my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+    my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+    my $oldaction = POSIX::SigAction->new();
+    sigaction( SIGALRM, $action, $oldaction ); 
+
+    # 执行命令
+    my $result;    
+    eval {
+        alarm $timeout;
+        $result = `$command`;
+        alarm 0;    
+    };
+    alarm 0; 
+    sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+    # 异常处理
+    if ( $@ ) {
+        $log->error("$@");
+            
+        if ( $@ =~ /$timeout_msg/ ) {
+            $log->error("run command: $command timeout");
+        }else{
+            $log->error("run command: $command failed");
+        }
+        undef $@;
+
+        return;
+    }
+    
+    # 返回命令执行结果
+    $log->info("run command: $command success");
+
+    return $result;
+}
+
+# @Description: 杀mysql连接会话线程
+# @Param: $dbh,$my_connection_id,$timeout
+# @Return: $kill_count:成功 undef:失败
+sub kill_mysql_session {
+    my ( $dbh,$my_connection_id,$timeout ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $timeout_msg = "KMS_TIMEOUT"; 
+    my $sigset = POSIX::SigSet->new( SIGALRM );  # signals to mask in the handler
+    my $action = POSIX::SigAction->new( sub { die $timeout_msg; },$sigset,);
+    my $oldaction = POSIX::SigAction->new();
+    sigaction( SIGALRM, $action, $oldaction ); 
+    
+    # 杀掉连接会话数量
+    my $kill_count = 0;
+    eval {    
+        alarm $timeout;
+        
+        # sql语句
+        my $sql = "show processlist";
+        $log->debug("$sql");
+        
+        # 执行sql
+        my $sth = $dbh->prepare($sql);
+        $sth->execute();
+        while ( my $row_ref = $sth->fetchrow_arrayref() ) {        
+            if ( $row_ref ){
+                my $session_id = $row_ref->[0];
+                my $session_user = $row_ref->[1];
+                chomp($session_id);
+                chomp($session_user);
+
+                next if ( $my_connection_id == $session_id );
+                
+                # 不杀系统和复制用户
+                if ( $session_user && $session_user !~ /repadm|slave|event_scheduler|system|root|mysql|mysqlha|mha/i ){
+                    if ( $session_id ){
+                        $log->info("kill session: user->$session_user,id->$session_id");
+                        my $kill_sql = "kill $session_id"; 
+                        my $sth_n = $dbh->prepare($kill_sql);
+                        $sth_n->execute();
+                        $sth_n->finish();
+                        $kill_count++;
+                    }
+                } 
+            }
+        }
+        $sth->finish();
+        alarm 0;
+    };
+    alarm 0; # race condition protection
+    sigaction( SIGALRM, $oldaction );  # restore original signal handler
+    
+    if ( $@ ) {
+        $log->error("$@");
+        
+        if ( $@ =~ /$timeout_msg/ ) {
+            $log->error("kill session timeout");
+        }else{
+            $log->error("kill session failed");
+        }
+        undef $@;
+                    
+        return;
+    }
+
+    if ( $kill_count>0 ){
+        $log->info("kill session success");
+    }else{
+        $log->info("no session to kill");
+    }    
+
+    return $kill_count;
+}
+
+# @Description: 获取节点数据
+# @Param: 
+# @Return: 
+sub get_zk_node_data {
+    my ( $zkapi,$db_host,$db_port ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $result;
+
+    if ( defined($zkapi) ){
+        # url请求串
+        my $url = "http://".$zkapi."/archapi/paas/ext/provider/".$db_host."_".$db_port."?type=mysql";
+        $log->info("$url");
+        
+        # 请求命令    
+        my $cmd = "/usr/bin/curl $url";
+        $log->info("$cmd");
+        
+        # 执行命令
+        $result = &run_command($cmd,10);
+        $log->info("$result");
+    }
+        
+    return $result;
+}
+
+# @Description: 修改zk节点数据
+# @Param: 
+# @Return: 0:成功 1:失败
+sub set_zk_node_data {
+    my ( $zkapi,$db_host,$db_port,$weight,$role ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $exitCode;
+    
+    # url请求串
+    my $url = "http://".$zkapi."/archapi/paas/ext/provider/".$db_host."_".$db_port
+        ." -d \"type=mysql&weight=".$weight."&uri=/".$role."\"";
+    $log->info("$url");
+    
+    # 请求命令
+    my $cmd = "/usr/bin/curl -X POST $url";
+    $log->info("$cmd");
+
+    # 执行命令
+    my $result = &run_command($cmd,10);
+    chomp($result);
+    $log->info("$result");
+    
+    if ( lc($result) =~ /success/ ){
+        # 成功
+        $log->info("update $zkapi set weight=$weight role=$role success");
+        $exitCode = 0;     
+    }else{
+        # 失败
+        $log->error("update $zkapi set weight=$weight role=$role failed");
+        $exitCode = 1;
+    }
+    
+    return $exitCode;
+}
+
+# @Description: 创建zk节点
+# @Param: 
+# @Return: 0:成功 1:失败
+sub create_zk_node {
+    my ( $zkapi,$cur_db_host,$cur_db_port,$target_db_host,$target_db_port,$weight,$role ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $exitCode;
+
+    # url请求串
+    my $url = "http://".$zkapi."/archapi/paas/ext/provider/".$cur_db_host."_".$cur_db_port
+        ." -d \"type=mysql&provider=".$target_db_host."_".$target_db_port."&weight=".$weight."&uri=/".$role."\"";
+    $log->info("$url");
+    
+    my $cmd = "/usr/bin/curl -X PUT $url";
+    $log->info("$cmd");
+ 
+    my $result = &run_command($cmd,10);
+    chomp($result);
+    $log->info("$result");
+
+    if ( lc($result) =~ /success/ ){
+        $log->info("create zk node: ${target_db_port}_${target_db_port} success");
+        
+        $exitCode = 0;  
+    }else{
+        $log->error("create zk node: ${target_db_port}_${target_db_port} failed");
+        
+        $exitCode = 1;
+    }
+
+    return $exitCode;
+}
+
+# @Description: 删除zk节点
+# @Param: 
+# @Return: 0:成功 1:失败
+sub remove_zk_node {
+    my ( $zkapi,$db_host,$db_port,$weight,$db_role ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $exitCode;
+    
+    # url请求串
+    my $url = "http://".$zkapi."/archapi/paas/ext/provider/".$db_host."_".$db_port." -d \"type=mysql\"";
+    $log->info("$url");
+
+    my $cmd = "/usr/bin/curl -X DELETE $url";
+    $log->info("$cmd");
+
+    my $result = &run_command($cmd,10);
+    chomp($result);
+    $log->info("$result");
+
+    if ( lc($result) =~ /success/ ){
+        $log->info("remove zk node: ${db_host}_${db_port} success");
+
+        $exitCode = 0; 
+    }else{
+        $log->error("remove zk node: ${db_host}_${db_port} failed");
+        
+        $exitCode = 1;
+    }
+
+    return $exitCode;
+}
+
+# @Description: 删除provider下其它zk节点
+# @Param: 
+# @Return: 0:成功 1:失败
+sub remove_other_zk_node {
+    my ( $zkapi,$cur_db_host,$cur_db_port,$target_db_host,$target_db_port ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $exitCode;
+
+    my $url = "http://".$zkapi."/archapi/paas/ext/provider/".$cur_db_host."_".$cur_db_port
+        ."/del"." -d \"type=mysql&provider=".$target_db_host."_".$target_db_port."\"";
+    $log->info("$url");
+
+    my $cmd = "/usr/bin/curl -X DELETE $url";
+    $log->info("$cmd");
+
+    my $result = &run_command($cmd,10);
+    chomp($result);
+    $log->info("$result");
+
+    if ( lc($result) =~ /success/ ){
+        $log->info("remove zk node: ${target_db_host}_${target_db_port} success");
+
+        $exitCode = 0; 
+    }else{
+        $log->error("remove zk node: ${target_db_host}_${target_db_port} failed");
+
+        $exitCode = 1;
+    }
+
+    return $exitCode;
+}
+
+# @Description: 检查判断主库切换场景
+# @Param: $orig_master_host,$new_master_host
+# @Return: $switch_type
+sub check_switch_type {
+    my ( $orig_master_host,$new_master_host ) = @_;
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my $switch_type;
+
+    my @orig_master_ip_str = split(/\./, $orig_master_host);
+    my $orig_master_ip_suffix = $orig_master_ip_str[0] . $orig_master_ip_str[1] . $orig_master_ip_str[2];
+    chomp($orig_master_ip_suffix);
+    $log->debug("orig_master_ip_suffix: $orig_master_ip_suffix");
+
+    my @new_master_ip_str = split(/\./, $new_master_host);
+    my $new_master_ip_suffix = $new_master_ip_str[0] . $new_master_ip_str[1] . $new_master_ip_str[2];
+    chomp($new_master_ip_suffix);
+    $log->debug("new_master_ip_suffix: $new_master_ip_suffix");
+
+    if ( $orig_master_ip_suffix ne $new_master_ip_suffix ){
+        # 跨机房切换
+        $switch_type = "daul";
+
+    }else{
+        # 机房内切换
+        $switch_type = "single";
+
+    }
+    
+    $log->debug("get switch_type is $switch_type");
+
+    return $switch_type;
+}
+
+# @Description: 检查判断新旧rvip
+# @Param: $rvip_a,$rvip_b
+# @Return: $orig_rvip,$new_rvip
+sub get_rvip_type {
+    my ( $rvip_a,$vip_b,$orig_master_host,$new_master_host ) = @_;
+
+    my ( $orig_rvip,$new_rvip );
+
+    my $log = Log::Log4perl->get_logger("");
+
+    my @orig_master_ip_str = split(/\./, $orig_master_host);
+    my $orig_master_ip_suffix = $orig_master_ip_str[0] . $orig_master_ip_str[1] . $orig_master_ip_str[2];
+    chomp($orig_master_ip_suffix);
+
+    my @new_master_ip_str = split(/\./, $new_master_host);
+    my $new_master_ip_suffix = $new_master_ip_str[0] . $new_master_ip_str[1] . $new_master_ip_str[2];
+    chomp($new_master_ip_suffix);
+    
+    my @rvip_a_str = split(/\./, $rvip_a);
+    my $rvip_a_suffix = $rvip_a_str[0] . $rvip_a_str[1] . $rvip_a_str[2];
+    chomp($rvip_a_suffix);
+
+    my @rvip_b_str = split(/\./, $rvip_b);
+    my $rvip_b_suffix = $rvip_b_str[0] . $rvip_b_str[1] . $rvip_b_str[2];
+    chomp($rvip_b_suffix);
+
+    # 判断原读vip和新读vip
+    if ( $rvip_a_suffix eq $orig_master_ip_suffix ){
+        $orig_rvip = $rvip_a;
+        $new_rvip = $rvip_b;
+    }else{
+        $orig_rvip = $rvip_b;
+        $new_rvip = $rvip_a;
+    }
+    
+    $log->debug("get orig_rvip:$orig_rvip, new_rvip:$new_rvip");
+
+    return ( $orig_rvip,$new_rvip );
+}
+
+# @Description: 使用说明
+# @Param: 
+# @Return: 
+sub usage {
+    print "Usage: master_ip_failover --zkapi_a=$zkapi_a --zkapi_b=$zkapi_b  
+        --rvip_a=$rvip_a --rvip_b=$rvip_b --manager_workdir=manager_workdir 
+        --command=start|stop|stopssh|status --orig_master_host=host --orig_master_ip=ip 
+        --orig_master_port=port --new_master_host=host --new_master_ip=ip --new_master_port=port\n";
+}
